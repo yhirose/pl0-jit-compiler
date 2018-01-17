@@ -12,7 +12,7 @@ Build on Mac OS
 ---------------
 
 ```sh
-brew install llvm # LLVM 5.0.1
+brew install llvm
 export PATH="$PATH:/usr/local/opt/llvm/bin"
 make
 ```
@@ -52,8 +52,8 @@ END.
 100
 ```
 
-Benchmark with Fibonacci number on MacBook 2016
------------------------------------------------
+Benchmark with Fibonacci number [0, 35)
+---------------------------------------
 
 ```sh
 > make bench
