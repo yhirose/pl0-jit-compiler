@@ -72,6 +72,7 @@ struct Annotation {
 };
 
 typedef AstBase<Annotation> AstPL0;
+
 shared_ptr<SymbolScope> get_closest_scope(shared_ptr<AstPL0> ast) {
   ast = ast->parent;
   while (ast->tag != "block"_) {
@@ -88,22 +89,22 @@ struct SymbolScope {
     return ret ? true : (extend && outer ? outer->has_symbol(ident) : false);
   }
 
-  bool has_constant(const string& ident, bool extend = true) const {
+  bool has_constant(const string& ident) const {
     return constants.count(ident)
                ? true
-               : (extend && outer ? outer->has_constant(ident) : false);
+               : (outer ? outer->has_constant(ident) : false);
   }
 
-  bool has_variable(const string& ident, bool extend = true) const {
+  bool has_variable(const string& ident) const {
     return variables.count(ident)
                ? true
-               : (extend && outer ? outer->has_variable(ident) : false);
+               : (outer ? outer->has_variable(ident) : false);
   }
 
-  bool has_procedure(const string& ident, bool extend = true) const {
+  bool has_procedure(const string& ident) const {
     return procedures.count(ident)
                ? true
-               : (extend && outer ? outer->has_procedure(ident) : false);
+               : (outer ? outer->has_procedure(ident) : false);
   }
 
   shared_ptr<AstPL0> get_procedure(const string& ident) const {
@@ -125,7 +126,7 @@ void throw_runtime_error(const shared_ptr<AstPL0> node, const string& msg) {
       format_error_message(node->path, node->line, node->column, msg));
 }
 
-struct SymbolTable {
+struct SymbolTableBuilder {
   static void build_on_ast(const shared_ptr<AstPL0> ast,
                            shared_ptr<SymbolScope> scope = nullptr) {
     switch (ast->tag) {
@@ -641,7 +642,7 @@ int main(int argc, const char** argv) {
   if (parser.parse_n(source.data(), source.size(), ast, path)) {
     try {
       // Make a symbol table on the AST
-      SymbolTable::build_on_ast(ast);
+      SymbolTableBuilder::build_on_ast(ast);
 
       // JIT compile and execute
       JIT::run(ast);
