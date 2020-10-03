@@ -6,8 +6,10 @@
 //
 
 #include <peglib.h>
+
 #include <fstream>
 #include <sstream>
+
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/GenericValue.h"
 #include "llvm/ExecutionEngine/MCJIT.h"
@@ -59,11 +61,15 @@ auto grammar = R"(
   ~__        <- ![a-z0-9_] _
 )";
 
-string format_error_message(const string& path, size_t ln, size_t col,
+inline string format_error_message(const string& path, size_t ln, size_t col,
                             const string& msg) {
   stringstream ss;
   ss << path << ":" << ln << ":" << col << ": " << msg << endl;
   return ss.str();
+}
+
+inline llvm::StringRef to_StringRef(const std::string_view& sv) {
+  return llvm::StringRef(sv.data(), sv.size());
 }
 
 struct SymbolScope;
@@ -74,7 +80,7 @@ struct Annotation {
 
 typedef AstBase<Annotation> AstPL0;
 
-shared_ptr<SymbolScope> get_closest_scope(shared_ptr<AstPL0> ast) {
+inline shared_ptr<SymbolScope> get_closest_scope(shared_ptr<AstPL0> ast) {
   ast = ast->parent.lock();
   while (ast->tag != "block"_) {
     ast = ast->parent.lock();
@@ -85,44 +91,44 @@ shared_ptr<SymbolScope> get_closest_scope(shared_ptr<AstPL0> ast) {
 struct SymbolScope {
   SymbolScope(shared_ptr<SymbolScope> outer) : outer(outer) {}
 
-  bool has_symbol(const string& ident, bool extend = true) const {
+  bool has_symbol(string_view ident, bool extend = true) const {
     auto ret = constants.count(ident) || variables.count(ident);
     return ret ? true : (extend && outer ? outer->has_symbol(ident) : false);
   }
 
-  bool has_constant(const string& ident) const {
+  bool has_constant(string_view ident) const {
     return constants.count(ident)
                ? true
                : (outer ? outer->has_constant(ident) : false);
   }
 
-  bool has_variable(const string& ident) const {
+  bool has_variable(string_view ident) const {
     return variables.count(ident)
                ? true
                : (outer ? outer->has_variable(ident) : false);
   }
 
-  bool has_procedure(const string& ident) const {
+  bool has_procedure(string_view ident) const {
     return procedures.count(ident)
                ? true
                : (outer ? outer->has_procedure(ident) : false);
   }
 
-  shared_ptr<AstPL0> get_procedure(const string& ident) const {
+  shared_ptr<AstPL0> get_procedure(string_view ident) const {
     auto it = procedures.find(ident);
     return it != procedures.end() ? it->second : outer->get_procedure(ident);
   }
 
-  map<string, int> constants;
-  set<string> variables;
-  map<string, shared_ptr<AstPL0>> procedures;
-  set<string> free_variables;
+  map<string_view, int> constants;
+  set<string_view> variables;
+  map<string_view, shared_ptr<AstPL0>> procedures;
+  set<string_view> free_variables;
 
  private:
   shared_ptr<SymbolScope> outer;
 };
 
-void throw_runtime_error(const shared_ptr<AstPL0> node, const string& msg) {
+inline void throw_runtime_error(const shared_ptr<AstPL0> node, const string& msg) {
   throw runtime_error(
       format_error_message(node->path, node->line, node->column, msg));
 }
@@ -167,11 +173,12 @@ struct SymbolTableBuilder {
                         shared_ptr<SymbolScope> scope) {
     const auto& nodes = ast->nodes;
     for (auto i = 0u; i < nodes.size(); i += 2) {
-      const auto& ident = nodes[i + 0]->token;
+      auto ident = nodes[i + 0]->token;
       if (scope->has_symbol(ident)) {
-        throw_runtime_error(nodes[i], "'" + ident + "' is already defined...");
+        throw_runtime_error(
+            nodes[i], "'" + std::string(ident) + "' is already defined...");
       }
-      auto number = stoi(nodes[i + 1]->token);
+      auto number = nodes[i + 1]->token_to_number<int>();
       scope->constants.emplace(ident, number);
     }
   }
@@ -180,9 +187,10 @@ struct SymbolTableBuilder {
                         shared_ptr<SymbolScope> scope) {
     const auto& nodes = ast->nodes;
     for (auto i = 0u; i < nodes.size(); i += 1) {
-      const auto& ident = nodes[i]->token;
+      auto ident = nodes[i]->token;
       if (scope->has_symbol(ident)) {
-        throw_runtime_error(nodes[i], "'" + ident + "' is already defined...");
+        throw_runtime_error(
+            nodes[i], "'" + std::string(ident) + "' is already defined...");
       }
       scope->variables.emplace(ident);
     }
@@ -192,7 +200,7 @@ struct SymbolTableBuilder {
                          shared_ptr<SymbolScope> scope) {
     const auto& nodes = ast->nodes;
     for (auto i = 0u; i < nodes.size(); i += 2) {
-      const auto& ident = nodes[i + 0]->token;
+      auto ident = nodes[i + 0]->token;
       auto block = nodes[i + 1];
       scope->procedures[ident] = block;
       build_on_ast(block, scope);
@@ -201,13 +209,13 @@ struct SymbolTableBuilder {
 
   static void assignment(const shared_ptr<AstPL0> ast,
                          shared_ptr<SymbolScope> scope) {
-    const auto& ident = ast->nodes[0]->token;
+    auto ident = ast->nodes[0]->token;
     if (scope->has_constant(ident)) {
-      throw_runtime_error(ast->nodes[0],
-                          "cannot modify constant value '" + ident + "'...");
+      throw_runtime_error(ast->nodes[0], "cannot modify constant value '" +
+                                             std::string(ident) + "'...");
     } else if (!scope->has_variable(ident)) {
       throw_runtime_error(ast->nodes[0],
-                          "undefined variable '" + ident + "'...");
+                          "undefined variable '" + std::string(ident) + "'...");
     }
 
     build_on_ast(ast->nodes[1], scope);
@@ -219,10 +227,10 @@ struct SymbolTableBuilder {
 
   static void call(const shared_ptr<AstPL0> ast,
                    shared_ptr<SymbolScope> scope) {
-    const auto& ident = ast->nodes[0]->token;
+    auto ident = ast->nodes[0]->token;
     if (!scope->has_procedure(ident)) {
-      throw_runtime_error(ast->nodes[0],
-                          "undefined procedure '" + ident + "'...");
+      throw_runtime_error(
+          ast->nodes[0], "undefined procedure '" + std::string(ident) + "'...");
     }
 
     auto block = scope->get_procedure(ident);
@@ -237,9 +245,10 @@ struct SymbolTableBuilder {
 
   static void ident(const shared_ptr<AstPL0> ast,
                     shared_ptr<SymbolScope> scope) {
-    const auto& ident = ast->token;
+    auto ident = ast->token;
     if (!scope->has_symbol(ident)) {
-      throw_runtime_error(ast, "undefined variable '" + ident + "'...");
+      throw_runtime_error(ast,
+                          "undefined variable '" + std::string(ident) + "'...");
     }
 
     if (!scope->has_symbol(ident, false)) {
@@ -325,7 +334,8 @@ struct JIT {
         FunctionType::get(builder_.getInt32Ty(),
                           PointerType::get(builder_.getInt8Ty(), 0), true));
 
-    auto funccallee = module_->getOrInsertFunction("out", builder_.getVoidTy(), builder_.getInt32Ty());
+    auto funccallee = module_->getOrInsertFunction("out", builder_.getVoidTy(),
+                                                   builder_.getInt32Ty());
     auto outC = funccallee.getCallee();
     auto outF = cast<Function>(outC);
 
@@ -344,7 +354,8 @@ struct JIT {
   }
 
   void compile_program(const shared_ptr<AstPL0> ast) {
-    auto funccallee = module_->getOrInsertFunction("main", builder_.getVoidTy());
+    auto funccallee =
+        module_->getOrInsertFunction("main", builder_.getVoidTy());
     auto c = funccallee.getCallee();
     auto fn = cast<Function>(c);
 
@@ -367,10 +378,10 @@ struct JIT {
   void compile_const(const shared_ptr<AstPL0> ast) {
     for (auto i = 0u; i < ast->nodes.size(); i += 2) {
       auto ident = ast->nodes[i]->token;
-      auto number = stoi(ast->nodes[i + 1]->token);
+      auto number = ast->nodes[i + 1]->token_to_number<int>();
 
-      auto alloca =
-          builder_.CreateAlloca(builder_.getInt32Ty(), nullptr, ident);
+      auto alloca = builder_.CreateAlloca(builder_.getInt32Ty(), nullptr,
+                                          to_StringRef(ident));
       builder_.CreateStore(builder_.getInt32(number), alloca);
     }
   }
@@ -378,7 +389,8 @@ struct JIT {
   void compile_var(const shared_ptr<AstPL0> ast) {
     for (const auto node : ast->nodes) {
       auto ident = node->token;
-      builder_.CreateAlloca(builder_.getInt32Ty(), nullptr, ident);
+      builder_.CreateAlloca(builder_.getInt32Ty(), nullptr,
+                            to_StringRef(ident));
     }
   }
 
@@ -390,14 +402,15 @@ struct JIT {
       std::vector<Type*> pt(block->scope->free_variables.size(),
                             Type::getInt32PtrTy(context_));
       auto ft = FunctionType::get(builder_.getVoidTy(), pt, false);
-      auto funccallee = module_->getOrInsertFunction(ident, ft);
+      auto funccallee = module_->getOrInsertFunction(to_StringRef(ident), ft);
       auto c = funccallee.getCallee();
       auto fn = cast<Function>(c);
 
       {
         auto it = block->scope->free_variables.begin();
         for (auto& arg : fn->args()) {
-          arg.setName(*it);
+          auto& sv = *it;
+          arg.setName(to_StringRef(sv));
           ++it;
         }
       }
@@ -425,9 +438,10 @@ struct JIT {
 
     auto fn = builder_.GetInsertBlock()->getParent();
     auto tbl = fn->getValueSymbolTable();
-    auto var = tbl->lookup(ident);
+    auto var = tbl->lookup(to_StringRef(ident));
     if (!var) {
-      throw_runtime_error(ast, "'" + ident + "' is not defined...");
+      throw_runtime_error(ast,
+                          "'" + std::string(ident) + "' is not defined...");
     }
 
     auto val = compile_expression(ast->nodes[1]);
@@ -444,14 +458,15 @@ struct JIT {
     for (auto& free : block->scope->free_variables) {
       auto fn = builder_.GetInsertBlock()->getParent();
       auto tbl = fn->getValueSymbolTable();
-      auto var = tbl->lookup(free);
+      auto var = tbl->lookup(to_StringRef(free));
       if (!var) {
-        throw_runtime_error(ast, "'" + free + "' is not defined...");
+        throw_runtime_error(ast,
+                            "'" + std::string(free) + "' is not defined...");
       }
       args.push_back(var);
     }
 
-    auto fn = module_->getFunction(ident);
+    auto fn = module_->getFunction(to_StringRef(ident));
     builder_.CreateCall(fn, args);
   }
 
@@ -514,7 +529,7 @@ struct JIT {
     auto lhs = compile_expression(ast->nodes[0]);
     auto rhs = compile_expression(ast->nodes[2]);
 
-    const auto& ope = ast->nodes[1]->token;
+    auto ope = ast->nodes[1]->token;
     switch (ope[0]) {
       case '=':
         return builder_.CreateICmpEQ(lhs, rhs, "icmpeq");
@@ -602,17 +617,18 @@ struct JIT {
 
     auto fn = builder_.GetInsertBlock()->getParent();
     auto tbl = fn->getValueSymbolTable();
-    auto var = tbl->lookup(ident);
+    auto var = tbl->lookup(to_StringRef(ident));
     if (!var) {
-      throw_runtime_error(ast, "'" + ident + "' is not defined...");
+      throw_runtime_error(ast,
+                          "'" + std::string(ident) + "' is not defined...");
     }
 
     return builder_.CreateLoad(var);
   }
 
   Value* compile_number(const shared_ptr<AstPL0> ast) {
-    return ConstantInt::getIntegerValue(builder_.getInt32Ty(),
-                                        APInt(32, ast->token, 10));
+    return ConstantInt::getIntegerValue(
+        builder_.getInt32Ty(), APInt(32, to_StringRef(ast->token), 10));
   }
 };
 
