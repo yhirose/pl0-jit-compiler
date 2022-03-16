@@ -6,7 +6,7 @@ A tiny [PL/0](https://en.wikipedia.org/wiki/PL/0) JIT compiler in less than 700 
 Library dependencies:
 
   * Parse and AST build: [cpp-peglib](https://github.com/yhirose/cpp-peglib)
-  * Code Generation: [LLVM 9.0.0](http://releases.llvm.org/9.0.0/docs/index.html)
+  * Code Generation: [LLVM 13.0.1](http://releases.llvm.org/13.0.1/docs/index.html)
 
 Build on Mac OS
 ---------------
