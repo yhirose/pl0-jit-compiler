@@ -623,7 +623,7 @@ struct JIT {
                           "'" + std::string(ident) + "' is not defined...");
     }
 
-    return builder_.CreateLoad(var);
+    return builder_.CreateLoad(builder_.getInt32Ty(), var);
   }
 
   Value* compile_number(const shared_ptr<AstPL0> ast) {
