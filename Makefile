@@ -1,7 +1,7 @@
 bench: pl0
 	@echo '*** Python ***'
-	@echo `python --version`
-	@echo `time python samples/fib.py > /dev/null`
+	@echo `python3 --version`
+	@echo `time python3 samples/fib.py > /dev/null`
 	@echo '*** Ruby ***'
 	@echo `ruby --version`
 	@echo `time ruby samples/fib.rb > /dev/null`
