@@ -1,7 +1,7 @@
 PL/0 JIT compiler
 =================
 
-A tiny [PL/0](https://en.wikipedia.org/wiki/PL/0) JIT compiler in less than 700 LOC with LLVM and PEG parser.
+A tiny [PL/0](https://en.wikipedia.org/wiki/PL/0) JIT compiler in less than 900 LOC with LLVM and PEG parser which handles 'Divide by Zero'.
 
 Library dependencies:
 

@@ -62,7 +62,7 @@ auto grammar = R"(
 )";
 
 inline string format_error_message(const string& path, size_t ln, size_t col,
-                            const string& msg) {
+                                   const string& msg) {
   stringstream ss;
   ss << path << ":" << ln << ":" << col << ": " << msg << endl;
   return ss.str();
@@ -128,7 +128,8 @@ struct SymbolScope {
   shared_ptr<SymbolScope> outer;
 };
 
-inline void throw_runtime_error(const shared_ptr<AstPL0> node, const string& msg) {
+inline void throw_runtime_error(const shared_ptr<AstPL0> node,
+                                const string& msg) {
   throw runtime_error(
       format_error_message(node->path, node->line, node->column, msg));
 }
@@ -262,14 +263,22 @@ struct JIT {
     JIT jit;
     jit.compile(ast);
     jit.exec();
+    // jit.dump();
   }
 
  private:
   LLVMContext context_;
   IRBuilder<> builder_;
   unique_ptr<Module> module_;
+  GlobalVariable* tyinfo_ = nullptr;
 
-  JIT() : builder_(context_) { module_ = make_unique<Module>("pl0", context_); }
+  JIT() : builder_(context_) {
+    module_ = make_unique<Module>("pl0", context_);
+
+    tyinfo_ =
+        new GlobalVariable(*module_, builder_.getInt8PtrTy(), true,
+                           GlobalValue::ExternalLinkage, nullptr, "_ZTIPKc");
+  }
 
   void compile(const shared_ptr<AstPL0> ast) {
     InitializeNativeTarget();
@@ -280,10 +289,10 @@ struct JIT {
 
   void exec() {
     unique_ptr<ExecutionEngine> ee(EngineBuilder(std::move(module_)).create());
-    std::vector<GenericValue> noargs;
-    auto fn = ee->FindFunctionNamed("main");
-    auto ret = ee->runFunction(fn, noargs);
+    auto ret = ee->runFunction(ee->FindFunctionNamed("main"), {});
   }
+
+  void dump() { module_->print(llvm::outs(), nullptr); }
 
   void compile_switch(const shared_ptr<AstPL0> ast) {
     switch (ast->tag) {
@@ -329,42 +338,135 @@ struct JIT {
   }
 
   void compile_libs() {
-    auto printfF = module_->getOrInsertFunction(
-        "printf",
-        FunctionType::get(builder_.getInt32Ty(),
-                          PointerType::get(builder_.getInt8Ty(), 0), true));
-
-    auto funccallee = module_->getOrInsertFunction("out", builder_.getVoidTy(),
-                                                   builder_.getInt32Ty());
-    auto outC = funccallee.getCallee();
-    auto outF = cast<Function>(outC);
+    // `out` function
+    auto outFn =
+        cast<Function>(module_
+                           ->getOrInsertFunction("out", builder_.getVoidTy(),
+                                                 builder_.getInt32Ty())
+                           .getCallee());
 
     {
-      auto BB = BasicBlock::Create(context_, "entry", outF);
+      auto BB = BasicBlock::Create(context_, "entry", outFn);
       builder_.SetInsertPoint(BB);
 
-      auto val = &*outF->arg_begin();
+      auto printFn = module_->getOrInsertFunction(
+          "printf",
+          FunctionType::get(builder_.getInt32Ty(),
+                            PointerType::get(builder_.getInt8Ty(), 0), true));
 
-      auto fmt = builder_.CreateGlobalStringPtr("%d\n");
+      auto val = &*outFn->arg_begin();
+      auto fmt = builder_.CreateGlobalStringPtr("%d\n", ".printf.fmt");
       std::vector<Value*> args = {fmt, val};
-      builder_.CreateCall(printfF, args);
+      builder_.CreateCall(printFn, args);
 
       builder_.CreateRetVoid();
+      verifyFunction(*outFn);
     }
   }
 
   void compile_program(const shared_ptr<AstPL0> ast) {
-    auto funccallee =
-        module_->getOrInsertFunction("main", builder_.getVoidTy());
-    auto c = funccallee.getCallee();
-    auto fn = cast<Function>(c);
+    // `start` function
+    auto startFn = cast<Function>(
+        module_->getOrInsertFunction("__pl0_start", builder_.getVoidTy())
+            .getCallee());
 
     {
-      auto BB = BasicBlock::Create(context_, "entry", fn);
+      auto BB = BasicBlock::Create(context_, "entry", startFn);
       builder_.SetInsertPoint(BB);
+
       compile_block(ast->nodes[0]);
+
       builder_.CreateRetVoid();
-      verifyFunction(*fn);
+      verifyFunction(*startFn);
+    }
+
+    // `main` function
+    auto mainFn = cast<Function>(
+        module_->getOrInsertFunction("main", builder_.getVoidTy()).getCallee());
+
+    {
+      auto personalityFn = Function::Create(
+          FunctionType::get(builder_.getInt32Ty(), {}, true),
+          GlobalValue::ExternalLinkage, "__gxx_personality_v0", module_.get());
+
+      mainFn->setPersonalityFn(personalityFn);
+
+      auto BB = BasicBlock::Create(context_, "entry", mainFn);
+      builder_.SetInsertPoint(BB);
+
+      auto fn = builder_.GetInsertBlock()->getParent();
+      auto lpadBB = BasicBlock::Create(context_, "lpad", fn);
+      auto endBB = BasicBlock::Create(context_, "end");
+      builder_.CreateInvoke(startFn, endBB, lpadBB);
+
+      builder_.SetInsertPoint(lpadBB);
+
+      auto exc = builder_.CreateLandingPad(
+          StructType::get(builder_.getInt8PtrTy(), builder_.getInt32Ty()), 1,
+          "exc");
+
+      exc->addClause(
+          ConstantExpr::getBitCast(tyinfo_, builder_.getInt8PtrTy()));
+
+      auto ptr = builder_.CreateExtractValue(exc, {0}, "exc.ptr");
+      auto sel = builder_.CreateExtractValue(exc, {1}, "exc.sel");
+
+      auto id = builder_.CreateCall(
+          cast<Function>(module_
+                             ->getOrInsertFunction("llvm.eh.typeid.for",
+                                                   builder_.getInt32Ty(),
+                                                   builder_.getInt8PtrTy())
+                             .getCallee()),
+          {ConstantExpr::getBitCast(tyinfo_, builder_.getInt8PtrTy())},
+          "tid.int");
+
+      auto catch_with_message =
+          BasicBlock::Create(context_, "catch_with_message", fn);
+      auto catch_unknown = BasicBlock::Create(context_, "catch_unknown", fn);
+      auto cmp = builder_.CreateCmp(CmpInst::ICMP_EQ, sel, id, "tst.int");
+      builder_.CreateCondBr(cmp, catch_with_message, catch_unknown);
+
+      auto beginCatchFn =
+          cast<Function>(module_
+                             ->getOrInsertFunction("__cxa_begin_catch",
+                                                   builder_.getInt8PtrTy(),
+                                                   builder_.getInt8PtrTy())
+                             .getCallee());
+
+      auto endCatchFn =
+          module_->getOrInsertFunction("__cxa_end_catch", builder_.getVoidTy());
+
+      auto putFn = module_->getOrInsertFunction("puts", builder_.getInt32Ty(),
+                                                builder_.getInt8PtrTy());
+
+      {
+        builder_.SetInsertPoint(catch_with_message);
+
+        auto str = builder_.CreateCall(beginCatchFn, ptr, "str");
+        builder_.CreateCall(putFn, str);
+        builder_.CreateCall(endCatchFn);
+        builder_.CreateBr(endBB);
+      }
+
+      {
+        builder_.SetInsertPoint(catch_unknown);
+
+        builder_.CreateCall(beginCatchFn, ptr);
+        auto str =
+            builder_.CreateGlobalStringPtr("unknown error...", ".str.unknown");
+        builder_.CreateCall(putFn, str);
+        builder_.CreateCall(endCatchFn);
+        builder_.CreateBr(endBB);
+      }
+
+      {
+        fn->getBasicBlockList().push_back(endBB);
+        builder_.SetInsertPoint(endBB);
+
+        builder_.CreateRetVoid();
+      }
+
+      verifyFunction(*mainFn);
     }
   }
 
@@ -401,10 +503,12 @@ struct JIT {
 
       std::vector<Type*> pt(block->scope->free_variables.size(),
                             Type::getInt32PtrTy(context_));
-      auto ft = FunctionType::get(builder_.getVoidTy(), pt, false);
-      auto funccallee = module_->getOrInsertFunction(to_StringRef(ident), ft);
-      auto c = funccallee.getCallee();
-      auto fn = cast<Function>(c);
+      auto fn = cast<Function>(
+          module_
+              ->getOrInsertFunction(
+                  to_StringRef(ident),
+                  FunctionType::get(builder_.getVoidTy(), pt, false))
+              .getCallee());
 
       {
         auto it = block->scope->free_variables.begin();
@@ -480,40 +584,40 @@ struct JIT {
     auto cond = compile_condition(ast->nodes[0]);
 
     auto fn = builder_.GetInsertBlock()->getParent();
-    auto ifThen = BasicBlock::Create(context_, "if.then", fn);
-    auto ifEnd = BasicBlock::Create(context_, "if.end");
+    auto ifTenBB = BasicBlock::Create(context_, "if.then", fn);
+    auto ifEndBB = BasicBlock::Create(context_, "if.end");
 
-    builder_.CreateCondBr(cond, ifThen, ifEnd);
+    builder_.CreateCondBr(cond, ifTenBB, ifEndBB);
 
-    builder_.SetInsertPoint(ifThen);
+    builder_.SetInsertPoint(ifTenBB);
     compile_statement(ast->nodes[1]);
-    builder_.CreateBr(ifEnd);
+    builder_.CreateBr(ifEndBB);
 
-    fn->getBasicBlockList().push_back(ifEnd);
-    builder_.SetInsertPoint(ifEnd);
+    fn->getBasicBlockList().push_back(ifEndBB);
+    builder_.SetInsertPoint(ifEndBB);
   }
 
   void compile_while(const shared_ptr<AstPL0> ast) {
-    auto whileCond = BasicBlock::Create(context_, "while.cond");
-    builder_.CreateBr(whileCond);
+    auto whileCondBB = BasicBlock::Create(context_, "while.cond");
+    builder_.CreateBr(whileCondBB);
 
     auto fn = builder_.GetInsertBlock()->getParent();
-    fn->getBasicBlockList().push_back(whileCond);
-    builder_.SetInsertPoint(whileCond);
+    fn->getBasicBlockList().push_back(whileCondBB);
+    builder_.SetInsertPoint(whileCondBB);
 
     auto cond = compile_condition(ast->nodes[0]);
 
-    auto whileBody = BasicBlock::Create(context_, "while.body", fn);
-    auto whileEnd = BasicBlock::Create(context_, "while.end");
-    builder_.CreateCondBr(cond, whileBody, whileEnd);
+    auto whileBodyBB = BasicBlock::Create(context_, "while.body", fn);
+    auto whileEndBB = BasicBlock::Create(context_, "while.end");
+    builder_.CreateCondBr(cond, whileBodyBB, whileEndBB);
 
-    builder_.SetInsertPoint(whileBody);
+    builder_.SetInsertPoint(whileBodyBB);
     compile_statement(ast->nodes[1]);
 
-    builder_.CreateBr(whileCond);
+    builder_.CreateBr(whileCondBB);
 
-    fn->getBasicBlockList().push_back(whileEnd);
-    builder_.SetInsertPoint(whileEnd);
+    fn->getBasicBlockList().push_back(whileEndBB);
+    builder_.SetInsertPoint(whileEndBB);
   }
 
   Value* compile_condition(const shared_ptr<AstPL0> ast) {
@@ -553,8 +657,8 @@ struct JIT {
 
   void compile_out(const shared_ptr<AstPL0> ast) {
     auto val = compile_expression(ast->nodes[0]);
-    auto outF = module_->getFunction("out");
-    builder_.CreateCall(outF, val);
+    auto fn = module_->getFunction("out");
+    builder_.CreateCall(fn, val);
   }
 
   Value* compile_expression(const shared_ptr<AstPL0> ast) {
@@ -594,13 +698,64 @@ struct JIT {
           val = builder_.CreateMul(val, rval, "mul");
           break;
         case '/': {
-          // TODO: Zero devide error?
-          // auto ret = builder_.CreateICmpEQ(rval, builder_.getInt32(0),
-          // "icmpeq");
-          // if (!ret) {
-          //   throw_runtime_error(ast, "divide by 0 error");
-          // }
-          val = builder_.CreateSDiv(val, rval, "div");
+          // Zero divide check
+          auto cond =
+              builder_.CreateICmpEQ(rval, builder_.getInt32(0), "icmpeq");
+
+          auto fn = builder_.GetInsertBlock()->getParent();
+          auto ifZeroBB = BasicBlock::Create(context_, "zdiv.zero", fn);
+          auto ifNonZeroBB = BasicBlock::Create(context_, "zdiv.non_zero");
+          builder_.CreateCondBr(cond, ifZeroBB, ifNonZeroBB);
+
+          // zero
+          {
+            builder_.SetInsertPoint(ifZeroBB);
+
+            Value* eh = nullptr;
+            {
+              auto fn = cast<Function>(
+                  module_
+                      ->getOrInsertFunction("__cxa_allocate_exception",
+                                            builder_.getInt8PtrTy(),
+                                            builder_.getInt64Ty())
+                      .getCallee());
+
+              eh = builder_.CreateCall(fn, builder_.getInt64(8), "eh");
+
+              auto payload = builder_.CreateBitCast(
+                  eh, builder_.getInt8PtrTy()->getPointerTo(), "payload");
+
+              auto msg = builder_.CreateGlobalStringPtr(
+                  "divide by 0", ".str.zero_divide", 0, module_.get());
+
+              builder_.CreateStore(msg, payload);
+            }
+
+            {
+              auto fn = cast<Function>(
+                  module_
+                      ->getOrInsertFunction("__cxa_throw", builder_.getVoidTy(),
+                                            builder_.getInt8PtrTy(),
+                                            builder_.getInt8PtrTy(),
+                                            builder_.getInt8PtrTy())
+                      .getCallee());
+
+              builder_.CreateCall(
+                  fn,
+                  {eh,
+                   ConstantExpr::getBitCast(tyinfo_, builder_.getInt8PtrTy()),
+                   ConstantPointerNull::get(builder_.getInt8PtrTy())});
+            }
+
+            builder_.CreateUnreachable();
+          }
+
+          // no_zero
+          {
+            fn->getBasicBlockList().push_back(ifNonZeroBB);
+            builder_.SetInsertPoint(ifNonZeroBB);
+            val = builder_.CreateSDiv(val, rval, "div");
+          }
           break;
         }
       }
