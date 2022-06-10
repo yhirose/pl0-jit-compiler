@@ -27,14 +27,6 @@ declare void @__cxa_throw(i8*, i8*, i8*)
 
 @.str.zero_divide = private unnamed_addr constant [12 x i8] c"divide by 0\00"
 
-; define void @divide(i32* %x) {
-; entry:
-;   %0 = load i32, i32* %x, align 4
-;   %div = sdiv i32 100, %0
-;   call void @out(i32 %div)
-;   ret void
-; }
-
 define void @divide(i32* %x) {
 entry:
   %0 = load i32, i32* %x, align 4
@@ -45,7 +37,6 @@ entry:
 zdiv.zero:
   %eh = call i8* @__cxa_allocate_exception(i64 8)
   %payload = bitcast i8* %eh to i8**
-  store i8* getelementptr ([12 x i8], [12 x i8]* @.str.zero_divide, i64 0, i64 0), i8** %payload
   %msg = bitcast [12 x i8]* @.str.zero_divide to i8*
   store i8* %msg, i8** %payload
   call void @__cxa_throw(i8* %eh, i8* bitcast (i8** @_ZTIPKc to i8*), i8* null)
