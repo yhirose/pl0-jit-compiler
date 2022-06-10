@@ -68,10 +68,6 @@ inline string format_error_message(const string& path, size_t ln, size_t col,
   return ss.str();
 }
 
-inline llvm::StringRef to_StringRef(const std::string_view& sv) {
-  return llvm::StringRef(sv.data(), sv.size());
-}
-
 struct SymbolScope;
 
 struct Annotation {
@@ -356,8 +352,7 @@ struct JIT {
 
       auto val = &*outFn->arg_begin();
       auto fmt = builder_.CreateGlobalStringPtr("%d\n", ".printf.fmt");
-      std::vector<Value*> args = {fmt, val};
-      builder_.CreateCall(printFn, args);
+      builder_.CreateCall(printFn, {fmt, val});
 
       builder_.CreateRetVoid();
       verifyFunction(*outFn);
@@ -482,8 +477,8 @@ struct JIT {
       auto ident = ast->nodes[i]->token;
       auto number = ast->nodes[i + 1]->token_to_number<int>();
 
-      auto alloca = builder_.CreateAlloca(builder_.getInt32Ty(), nullptr,
-                                          to_StringRef(ident));
+      auto alloca =
+          builder_.CreateAlloca(builder_.getInt32Ty(), nullptr, ident);
       builder_.CreateStore(builder_.getInt32(number), alloca);
     }
   }
@@ -491,8 +486,7 @@ struct JIT {
   void compile_var(const shared_ptr<AstPL0> ast) {
     for (const auto node : ast->nodes) {
       auto ident = node->token;
-      builder_.CreateAlloca(builder_.getInt32Ty(), nullptr,
-                            to_StringRef(ident));
+      builder_.CreateAlloca(builder_.getInt32Ty(), nullptr, ident);
     }
   }
 
@@ -506,15 +500,14 @@ struct JIT {
       auto fn = cast<Function>(
           module_
               ->getOrInsertFunction(
-                  to_StringRef(ident),
-                  FunctionType::get(builder_.getVoidTy(), pt, false))
+                  ident, FunctionType::get(builder_.getVoidTy(), pt, false))
               .getCallee());
 
       {
         auto it = block->scope->free_variables.begin();
         for (auto& arg : fn->args()) {
           auto& sv = *it;
-          arg.setName(to_StringRef(sv));
+          arg.setName(sv);
           ++it;
         }
       }
@@ -542,7 +535,7 @@ struct JIT {
 
     auto fn = builder_.GetInsertBlock()->getParent();
     auto tbl = fn->getValueSymbolTable();
-    auto var = tbl->lookup(to_StringRef(ident));
+    auto var = tbl->lookup(ident);
     if (!var) {
       throw_runtime_error(ast,
                           "'" + std::string(ident) + "' is not defined...");
@@ -562,7 +555,7 @@ struct JIT {
     for (auto& free : block->scope->free_variables) {
       auto fn = builder_.GetInsertBlock()->getParent();
       auto tbl = fn->getValueSymbolTable();
-      auto var = tbl->lookup(to_StringRef(free));
+      auto var = tbl->lookup(free);
       if (!var) {
         throw_runtime_error(ast,
                             "'" + std::string(free) + "' is not defined...");
@@ -570,7 +563,7 @@ struct JIT {
       args.push_back(var);
     }
 
-    auto fn = module_->getFunction(to_StringRef(ident));
+    auto fn = module_->getFunction(ident);
     builder_.CreateCall(fn, args);
   }
 
@@ -772,7 +765,7 @@ struct JIT {
 
     auto fn = builder_.GetInsertBlock()->getParent();
     auto tbl = fn->getValueSymbolTable();
-    auto var = tbl->lookup(to_StringRef(ident));
+    auto var = tbl->lookup(ident);
     if (!var) {
       throw_runtime_error(ast,
                           "'" + std::string(ident) + "' is not defined...");
@@ -782,8 +775,8 @@ struct JIT {
   }
 
   Value* compile_number(const shared_ptr<AstPL0> ast) {
-    return ConstantInt::getIntegerValue(
-        builder_.getInt32Ty(), APInt(32, to_StringRef(ast->token), 10));
+    return ConstantInt::getIntegerValue(builder_.getInt32Ty(),
+                                        APInt(32, ast->token, 10));
   }
 };
 
