@@ -806,9 +806,9 @@ int main(int argc, const char** argv) {
   // Setup a PEG parser
   parser parser(grammar);
   parser.enable_ast<AstPL0>();
-  parser.log = [&](size_t ln, size_t col, const string& msg) {
+  parser.set_logger([&](size_t ln, size_t col, const string& msg) {
     cerr << format_error_message(path, ln, col, msg) << endl;
-  };
+  });
 
   // Parse the source and make an AST
   shared_ptr<AstPL0> ast;
