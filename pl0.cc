@@ -255,11 +255,14 @@ struct SymbolTableBuilder {
 };
 
 struct JIT {
-  static void run(const shared_ptr<AstPL0> ast) {
+  static void run(const shared_ptr<AstPL0> ast, bool emit_llvm) {
     JIT jit;
     jit.compile(ast);
-    jit.exec();
-    // jit.dump();
+    if (emit_llvm) {
+      jit.dump();
+    } else {
+      jit.exec();
+    }
   }
 
  private:
@@ -782,12 +785,13 @@ struct JIT {
 
 int main(int argc, const char** argv) {
   if (argc < 2) {
-    cout << "usage: pl0 file" << endl;
+    cout << "usage: pl0 file [-emit-llvm]" << endl;
     return 1;
   }
 
   // Source file path
   auto path = argv[1];
+  auto emit_llvm = (argc >= 3 && !strcmp("-emit-llvm", argv[2]));
 
   // Read a source file into memory
   vector<char> source;
@@ -818,7 +822,7 @@ int main(int argc, const char** argv) {
       SymbolTableBuilder::build_on_ast(ast);
 
       // JIT compile and execute
-      JIT::run(ast);
+      JIT::run(ast, emit_llvm);
     } catch (const runtime_error& e) {
       cerr << e.what() << endl;
     }
