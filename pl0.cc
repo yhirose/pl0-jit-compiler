@@ -10,9 +10,8 @@
 #include <fstream>
 #include <sstream>
 
-#include "llvm/ExecutionEngine/ExecutionEngine.h"
-#include "llvm/ExecutionEngine/GenericValue.h"
-#include "llvm/ExecutionEngine/MCJIT.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/IR/Verifier.h"
@@ -256,250 +255,270 @@ struct SymbolTableBuilder {
 
 struct JIT {
   static void run(const shared_ptr<AstPL0> ast, bool emit_llvm) {
-    JIT jit;
-    jit.compile(ast);
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+
+    auto ctx = make_unique<LLVMContext>();
+    auto mod = make_unique<Module>("pl0", *ctx);
+    IRBuilder<> builder(*ctx);
+
+    auto tyinfo =
+        new GlobalVariable(*mod, builder.getPtrTy(), true,
+                           GlobalValue::ExternalLinkage, nullptr, "_ZTIPKc");
+
+    compile(builder, mod.get(), tyinfo, ast);
+
     if (emit_llvm) {
-      jit.dump();
+      mod->print(llvm::outs(), nullptr);
     } else {
-      jit.exec();
+      exec(std::move(ctx), std::move(mod));
     }
   }
 
  private:
-  LLVMContext context_;
-  IRBuilder<> builder_;
-  unique_ptr<Module> module_;
-  GlobalVariable* tyinfo_ = nullptr;
+  static void exec(unique_ptr<LLVMContext> ctx, unique_ptr<Module> mod) {
+    auto jit = cantFail(orc::LLJITBuilder().create());
 
-  JIT() : builder_(context_) {
-    module_ = make_unique<Module>("pl0", context_);
+    auto& jd = jit->getMainJITDylib();
+    auto gen = cantFail(
+        orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix()));
+    jd.addGenerator(std::move(gen));
 
-    tyinfo_ =
-        new GlobalVariable(*module_, builder_.getPtrTy(), true,
-                           GlobalValue::ExternalLinkage, nullptr, "_ZTIPKc");
+    orc::ThreadSafeContext tsctx(std::move(ctx));
+    cantFail(jit->addIRModule(
+        orc::ThreadSafeModule(std::move(mod), std::move(tsctx))));
+
+    auto mainFn = cantFail(jit->lookup("main")).toPtr<void (*)()>();
+    mainFn();
   }
 
-  void compile(const shared_ptr<AstPL0> ast) {
-    InitializeNativeTarget();
-    InitializeNativeTargetAsmPrinter();
-    compile_libs();
-    compile_program(ast);
+  static void compile(IRBuilder<>& builder, Module* module,
+                       GlobalVariable* tyinfo,
+                       const shared_ptr<AstPL0> ast) {
+    compile_libs(builder, module);
+    compile_program(builder, module, tyinfo, ast);
   }
 
-  void exec() {
-    unique_ptr<ExecutionEngine> ee(EngineBuilder(std::move(module_)).create());
-    auto ret = ee->runFunction(ee->FindFunctionNamed("main"), {});
-  }
-
-  void dump() { module_->print(llvm::outs(), nullptr); }
-
-  void compile_switch(const shared_ptr<AstPL0> ast) {
+  static void compile_switch(IRBuilder<>& builder, Module* module,
+                              GlobalVariable* tyinfo,
+                              const shared_ptr<AstPL0> ast) {
     switch (ast->tag) {
       case "assignment"_:
-        compile_assignment(ast);
+        compile_assignment(builder, module, tyinfo, ast);
         break;
       case "call"_:
-        compile_call(ast);
+        compile_call(builder, module, ast);
         break;
       case "statements"_:
-        compile_statements(ast);
+        compile_statements(builder, module, tyinfo, ast);
         break;
       case "if"_:
-        compile_if(ast);
+        compile_if(builder, module, tyinfo, ast);
         break;
       case "while"_:
-        compile_while(ast);
+        compile_while(builder, module, tyinfo, ast);
         break;
       case "out"_:
-        compile_out(ast);
+        compile_out(builder, module, tyinfo, ast);
         break;
       default:
-        compile_switch(ast->nodes[0]);
+        compile_switch(builder, module, tyinfo, ast->nodes[0]);
         break;
     }
   }
 
-  Value* compile_switch_value(const shared_ptr<AstPL0> ast) {
+  static Value* compile_switch_value(IRBuilder<>& builder, Module* module,
+                                     GlobalVariable* tyinfo,
+                                     const shared_ptr<AstPL0> ast) {
     switch (ast->tag) {
       case "odd"_:
-        return compile_odd(ast);
+        return compile_odd(builder, module, tyinfo, ast);
       case "compare"_:
-        return compile_compare(ast);
+        return compile_compare(builder, module, tyinfo, ast);
       case "expression"_:
-        return compile_expression(ast);
+        return compile_expression(builder, module, tyinfo, ast);
       case "ident"_:
-        return compile_ident(ast);
+        return compile_ident(builder, ast);
       case "number"_:
-        return compile_number(ast);
+        return compile_number(builder, ast);
       default:
-        return compile_switch_value(ast->nodes[0]);
+        return compile_switch_value(builder, module, tyinfo, ast->nodes[0]);
     }
   }
 
-  void compile_libs() {
+  static void compile_libs(IRBuilder<>& builder, Module* module) {
     // `out` function
     auto outFn =
-        cast<Function>(module_
-                           ->getOrInsertFunction("out", builder_.getVoidTy(),
-                                                 builder_.getInt32Ty())
+        cast<Function>(module
+                           ->getOrInsertFunction("out", builder.getVoidTy(),
+                                                 builder.getInt32Ty())
                            .getCallee());
 
     {
-      auto BB = BasicBlock::Create(context_, "entry", outFn);
-      builder_.SetInsertPoint(BB);
+      auto BB = BasicBlock::Create(builder.getContext(), "entry", outFn);
+      builder.SetInsertPoint(BB);
 
-      auto printFn = module_->getOrInsertFunction(
+      auto printFn = module->getOrInsertFunction(
           "printf",
-          FunctionType::get(builder_.getInt32Ty(), builder_.getPtrTy(), true));
+          FunctionType::get(builder.getInt32Ty(), builder.getPtrTy(), true));
 
       auto val = &*outFn->arg_begin();
-      auto fmt = builder_.CreateGlobalString("%d\n", ".printf.fmt");
-      builder_.CreateCall(printFn, {fmt, val});
+      auto fmt = builder.CreateGlobalString("%d\n", ".printf.fmt");
+      builder.CreateCall(printFn, {fmt, val});
 
-      builder_.CreateRetVoid();
+      builder.CreateRetVoid();
       verifyFunction(*outFn);
     }
   }
 
-  void compile_program(const shared_ptr<AstPL0> ast) {
+  static void compile_program(IRBuilder<>& builder, Module* module,
+                               GlobalVariable* tyinfo,
+                               const shared_ptr<AstPL0> ast) {
     // `start` function
     auto startFn = cast<Function>(
-        module_->getOrInsertFunction("__pl0_start", builder_.getVoidTy())
+        module->getOrInsertFunction("__pl0_start", builder.getVoidTy())
             .getCallee());
 
     {
-      auto BB = BasicBlock::Create(context_, "entry", startFn);
-      builder_.SetInsertPoint(BB);
+      auto BB = BasicBlock::Create(builder.getContext(), "entry", startFn);
+      builder.SetInsertPoint(BB);
 
-      compile_block(ast->nodes[0]);
+      compile_block(builder, module, tyinfo, ast->nodes[0]);
 
-      builder_.CreateRetVoid();
+      builder.CreateRetVoid();
       verifyFunction(*startFn);
     }
 
     // `main` function
     auto mainFn = cast<Function>(
-        module_->getOrInsertFunction("main", builder_.getVoidTy()).getCallee());
+        module->getOrInsertFunction("main", builder.getVoidTy()).getCallee());
 
     {
       auto personalityFn = Function::Create(
-          FunctionType::get(builder_.getInt32Ty(), {}, true),
-          GlobalValue::ExternalLinkage, "__gxx_personality_v0", module_.get());
+          FunctionType::get(builder.getInt32Ty(), {}, true),
+          GlobalValue::ExternalLinkage, "__gxx_personality_v0", module);
 
       mainFn->setPersonalityFn(personalityFn);
 
-      auto BB = BasicBlock::Create(context_, "entry", mainFn);
-      builder_.SetInsertPoint(BB);
+      auto BB = BasicBlock::Create(builder.getContext(), "entry", mainFn);
+      builder.SetInsertPoint(BB);
 
-      auto fn = builder_.GetInsertBlock()->getParent();
-      auto lpadBB = BasicBlock::Create(context_, "lpad", fn);
-      auto endBB = BasicBlock::Create(context_, "end");
-      builder_.CreateInvoke(startFn, endBB, lpadBB);
+      auto fn = builder.GetInsertBlock()->getParent();
+      auto lpadBB = BasicBlock::Create(builder.getContext(), "lpad", fn);
+      auto endBB = BasicBlock::Create(builder.getContext(), "end");
+      builder.CreateInvoke(startFn, endBB, lpadBB);
 
-      builder_.SetInsertPoint(lpadBB);
+      builder.SetInsertPoint(lpadBB);
 
-      auto exc = builder_.CreateLandingPad(
-          StructType::get(builder_.getPtrTy(), builder_.getInt32Ty()), 1,
+      auto exc = builder.CreateLandingPad(
+          StructType::get(builder.getPtrTy(), builder.getInt32Ty()), 1,
           "exc");
 
-      exc->addClause(tyinfo_);
+      exc->addClause(tyinfo);
 
-      auto ptr = builder_.CreateExtractValue(exc, {0}, "exc.ptr");
-      auto sel = builder_.CreateExtractValue(exc, {1}, "exc.sel");
+      auto ptr = builder.CreateExtractValue(exc, {0}, "exc.ptr");
+      auto sel = builder.CreateExtractValue(exc, {1}, "exc.sel");
 
-      auto id = builder_.CreateCall(
-          cast<Function>(module_
+      auto id = builder.CreateCall(
+          cast<Function>(module
                              ->getOrInsertFunction("llvm.eh.typeid.for",
-                                                   builder_.getInt32Ty(),
-                                                   builder_.getPtrTy())
+                                                   builder.getInt32Ty(),
+                                                   builder.getPtrTy())
                              .getCallee()),
-          {tyinfo_}, "tid.int");
+          {tyinfo}, "tid.int");
 
       auto catch_with_message =
-          BasicBlock::Create(context_, "catch_with_message", fn);
-      auto catch_unknown = BasicBlock::Create(context_, "catch_unknown", fn);
-      auto cmp = builder_.CreateCmp(CmpInst::ICMP_EQ, sel, id, "tst.int");
-      builder_.CreateCondBr(cmp, catch_with_message, catch_unknown);
+          BasicBlock::Create(builder.getContext(), "catch_with_message", fn);
+      auto catch_unknown = BasicBlock::Create(builder.getContext(), "catch_unknown", fn);
+      auto cmp = builder.CreateCmp(CmpInst::ICMP_EQ, sel, id, "tst.int");
+      builder.CreateCondBr(cmp, catch_with_message, catch_unknown);
 
       auto beginCatchFn = cast<Function>(
-          module_
-              ->getOrInsertFunction("__cxa_begin_catch", builder_.getPtrTy(),
-                                    builder_.getPtrTy())
+          module
+              ->getOrInsertFunction("__cxa_begin_catch", builder.getPtrTy(),
+                                    builder.getPtrTy())
               .getCallee());
 
       auto endCatchFn =
-          module_->getOrInsertFunction("__cxa_end_catch", builder_.getVoidTy());
+          module->getOrInsertFunction("__cxa_end_catch", builder.getVoidTy());
 
-      auto putFn = module_->getOrInsertFunction("puts", builder_.getInt32Ty(),
-                                                builder_.getPtrTy());
+      auto putFn = module->getOrInsertFunction("puts", builder.getInt32Ty(),
+                                                builder.getPtrTy());
 
       {
-        builder_.SetInsertPoint(catch_with_message);
+        builder.SetInsertPoint(catch_with_message);
 
-        auto str = builder_.CreateCall(beginCatchFn, ptr, "str");
-        builder_.CreateCall(putFn, str);
-        builder_.CreateCall(endCatchFn);
-        builder_.CreateBr(endBB);
+        auto str = builder.CreateCall(beginCatchFn, ptr, "str");
+        builder.CreateCall(putFn, str);
+        builder.CreateCall(endCatchFn);
+        builder.CreateBr(endBB);
       }
 
       {
-        builder_.SetInsertPoint(catch_unknown);
+        builder.SetInsertPoint(catch_unknown);
 
-        builder_.CreateCall(beginCatchFn, ptr);
+        builder.CreateCall(beginCatchFn, ptr);
         auto str =
-            builder_.CreateGlobalString("unknown error...", ".str.unknown");
-        builder_.CreateCall(putFn, str);
-        builder_.CreateCall(endCatchFn);
-        builder_.CreateBr(endBB);
+            builder.CreateGlobalString("unknown error...", ".str.unknown");
+        builder.CreateCall(putFn, str);
+        builder.CreateCall(endCatchFn);
+        builder.CreateBr(endBB);
       }
 
       {
         fn->insert(fn->end(), endBB);
-        builder_.SetInsertPoint(endBB);
+        builder.SetInsertPoint(endBB);
 
-        builder_.CreateRetVoid();
+        builder.CreateRetVoid();
       }
 
       verifyFunction(*mainFn);
     }
   }
 
-  void compile_block(const shared_ptr<AstPL0> ast) {
-    compile_const(ast->nodes[0]);
-    compile_var(ast->nodes[1]);
-    compile_procedure(ast->nodes[2]);
-    compile_statement(ast->nodes[3]);
+  static void compile_block(IRBuilder<>& builder, Module* module,
+                             GlobalVariable* tyinfo,
+                             const shared_ptr<AstPL0> ast) {
+    compile_const(builder, ast->nodes[0]);
+    compile_var(builder, ast->nodes[1]);
+    compile_procedure(builder, module, tyinfo, ast->nodes[2]);
+    compile_statement(builder, module, tyinfo, ast->nodes[3]);
   }
 
-  void compile_const(const shared_ptr<AstPL0> ast) {
+  static void compile_const(IRBuilder<>& builder,
+                             const shared_ptr<AstPL0> ast) {
     for (auto i = 0u; i < ast->nodes.size(); i += 2) {
       auto ident = ast->nodes[i]->token;
       auto number = ast->nodes[i + 1]->token_to_number<int>();
 
       auto alloca =
-          builder_.CreateAlloca(builder_.getInt32Ty(), nullptr, ident);
-      builder_.CreateStore(builder_.getInt32(number), alloca);
+          builder.CreateAlloca(builder.getInt32Ty(), nullptr, ident);
+      builder.CreateStore(builder.getInt32(number), alloca);
     }
   }
 
-  void compile_var(const shared_ptr<AstPL0> ast) {
+  static void compile_var(IRBuilder<>& builder,
+                           const shared_ptr<AstPL0> ast) {
     for (const auto node : ast->nodes) {
       auto ident = node->token;
-      builder_.CreateAlloca(builder_.getInt32Ty(), nullptr, ident);
+      builder.CreateAlloca(builder.getInt32Ty(), nullptr, ident);
     }
   }
 
-  void compile_procedure(const shared_ptr<AstPL0> ast) {
+  static void compile_procedure(IRBuilder<>& builder, Module* module,
+                                 GlobalVariable* tyinfo,
+                                 const shared_ptr<AstPL0> ast) {
     for (auto i = 0u; i < ast->nodes.size(); i += 2) {
       auto ident = ast->nodes[i]->token;
       auto block = ast->nodes[i + 1];
 
       std::vector<Type*> pt(block->scope->free_variables.size(),
-                            builder_.getPtrTy());
+                            builder.getPtrTy());
       auto fn = cast<Function>(
-          module_
+          module
               ->getOrInsertFunction(
-                  ident, FunctionType::get(builder_.getVoidTy(), pt, false))
+                  ident, FunctionType::get(builder.getVoidTy(), pt, false))
               .getCallee());
 
       {
@@ -512,27 +531,31 @@ struct JIT {
       }
 
       {
-        auto prevBB = builder_.GetInsertBlock();
-        auto BB = BasicBlock::Create(context_, "entry", fn);
-        builder_.SetInsertPoint(BB);
-        compile_block(block);
-        builder_.CreateRetVoid();
+        auto prevBB = builder.GetInsertBlock();
+        auto BB = BasicBlock::Create(builder.getContext(), "entry", fn);
+        builder.SetInsertPoint(BB);
+        compile_block(builder, module, tyinfo, block);
+        builder.CreateRetVoid();
         verifyFunction(*fn);
-        builder_.SetInsertPoint(prevBB);
+        builder.SetInsertPoint(prevBB);
       }
     }
   }
 
-  void compile_statement(const shared_ptr<AstPL0> ast) {
+  static void compile_statement(IRBuilder<>& builder, Module* module,
+                                 GlobalVariable* tyinfo,
+                                 const shared_ptr<AstPL0> ast) {
     if (!ast->nodes.empty()) {
-      compile_switch(ast->nodes[0]);
+      compile_switch(builder, module, tyinfo, ast->nodes[0]);
     }
   }
 
-  void compile_assignment(const shared_ptr<AstPL0> ast) {
+  static void compile_assignment(IRBuilder<>& builder, Module* module,
+                                  GlobalVariable* tyinfo,
+                                  const shared_ptr<AstPL0> ast) {
     auto ident = ast->nodes[0]->token;
 
-    auto fn = builder_.GetInsertBlock()->getParent();
+    auto fn = builder.GetInsertBlock()->getParent();
     auto tbl = fn->getValueSymbolTable();
     auto var = tbl->lookup(ident);
     if (!var) {
@@ -540,11 +563,12 @@ struct JIT {
                           "'" + std::string(ident) + "' is not defined...");
     }
 
-    auto val = compile_expression(ast->nodes[1]);
-    builder_.CreateStore(val, var);
+    auto val = compile_expression(builder, module, tyinfo, ast->nodes[1]);
+    builder.CreateStore(val, var);
   }
 
-  void compile_call(const shared_ptr<AstPL0> ast) {
+  static void compile_call(IRBuilder<>& builder, Module* module,
+                            const shared_ptr<AstPL0> ast) {
     auto ident = ast->nodes[0]->token;
 
     auto scope = get_closest_scope(ast);
@@ -552,7 +576,7 @@ struct JIT {
 
     std::vector<Value*> args;
     for (auto& free : block->scope->free_variables) {
-      auto fn = builder_.GetInsertBlock()->getParent();
+      auto fn = builder.GetInsertBlock()->getParent();
       auto tbl = fn->getValueSymbolTable();
       auto var = tbl->lookup(free);
       if (!var) {
@@ -562,186 +586,204 @@ struct JIT {
       args.push_back(var);
     }
 
-    auto fn = module_->getFunction(ident);
-    builder_.CreateCall(fn, args);
+    auto fn = module->getFunction(ident);
+    builder.CreateCall(fn, args);
   }
 
-  void compile_statements(const shared_ptr<AstPL0> ast) {
+  static void compile_statements(IRBuilder<>& builder, Module* module,
+                                  GlobalVariable* tyinfo,
+                                  const shared_ptr<AstPL0> ast) {
     for (auto node : ast->nodes) {
-      compile_statement(node);
+      compile_statement(builder, module, tyinfo, node);
     }
   }
 
-  void compile_if(const shared_ptr<AstPL0> ast) {
-    auto cond = compile_condition(ast->nodes[0]);
+  static void compile_if(IRBuilder<>& builder, Module* module,
+                          GlobalVariable* tyinfo,
+                          const shared_ptr<AstPL0> ast) {
+    auto cond = compile_condition(builder, module, tyinfo, ast->nodes[0]);
 
-    auto fn = builder_.GetInsertBlock()->getParent();
-    auto ifTenBB = BasicBlock::Create(context_, "if.then", fn);
-    auto ifEndBB = BasicBlock::Create(context_, "if.end");
+    auto fn = builder.GetInsertBlock()->getParent();
+    auto ifTenBB = BasicBlock::Create(builder.getContext(), "if.then", fn);
+    auto ifEndBB = BasicBlock::Create(builder.getContext(), "if.end");
 
-    builder_.CreateCondBr(cond, ifTenBB, ifEndBB);
+    builder.CreateCondBr(cond, ifTenBB, ifEndBB);
 
-    builder_.SetInsertPoint(ifTenBB);
-    compile_statement(ast->nodes[1]);
-    builder_.CreateBr(ifEndBB);
+    builder.SetInsertPoint(ifTenBB);
+    compile_statement(builder, module, tyinfo, ast->nodes[1]);
+    builder.CreateBr(ifEndBB);
 
     fn->insert(fn->end(), ifEndBB);
-    builder_.SetInsertPoint(ifEndBB);
+    builder.SetInsertPoint(ifEndBB);
   }
 
-  void compile_while(const shared_ptr<AstPL0> ast) {
-    auto whileCondBB = BasicBlock::Create(context_, "while.cond");
-    builder_.CreateBr(whileCondBB);
+  static void compile_while(IRBuilder<>& builder, Module* module,
+                             GlobalVariable* tyinfo,
+                             const shared_ptr<AstPL0> ast) {
+    auto whileCondBB = BasicBlock::Create(builder.getContext(), "while.cond");
+    builder.CreateBr(whileCondBB);
 
-    auto fn = builder_.GetInsertBlock()->getParent();
+    auto fn = builder.GetInsertBlock()->getParent();
     fn->insert(fn->end(), whileCondBB);
-    builder_.SetInsertPoint(whileCondBB);
+    builder.SetInsertPoint(whileCondBB);
 
-    auto cond = compile_condition(ast->nodes[0]);
+    auto cond = compile_condition(builder, module, tyinfo, ast->nodes[0]);
 
-    auto whileBodyBB = BasicBlock::Create(context_, "while.body", fn);
-    auto whileEndBB = BasicBlock::Create(context_, "while.end");
-    builder_.CreateCondBr(cond, whileBodyBB, whileEndBB);
+    auto whileBodyBB = BasicBlock::Create(builder.getContext(), "while.body", fn);
+    auto whileEndBB = BasicBlock::Create(builder.getContext(), "while.end");
+    builder.CreateCondBr(cond, whileBodyBB, whileEndBB);
 
-    builder_.SetInsertPoint(whileBodyBB);
-    compile_statement(ast->nodes[1]);
+    builder.SetInsertPoint(whileBodyBB);
+    compile_statement(builder, module, tyinfo, ast->nodes[1]);
 
-    builder_.CreateBr(whileCondBB);
+    builder.CreateBr(whileCondBB);
 
     fn->insert(fn->end(), whileEndBB);
-    builder_.SetInsertPoint(whileEndBB);
+    builder.SetInsertPoint(whileEndBB);
   }
 
-  Value* compile_condition(const shared_ptr<AstPL0> ast) {
-    return compile_switch_value(ast->nodes[0]);
+  static Value* compile_condition(IRBuilder<>& builder, Module* module,
+                                   GlobalVariable* tyinfo,
+                                   const shared_ptr<AstPL0> ast) {
+    return compile_switch_value(builder, module, tyinfo, ast->nodes[0]);
   }
 
-  Value* compile_odd(const shared_ptr<AstPL0> ast) {
-    auto val = compile_expression(ast->nodes[0]);
-    return builder_.CreateICmpNE(val, builder_.getInt32(0), "icmpne");
+  static Value* compile_odd(IRBuilder<>& builder, Module* module,
+                             GlobalVariable* tyinfo,
+                             const shared_ptr<AstPL0> ast) {
+    auto val = compile_expression(builder, module, tyinfo, ast->nodes[0]);
+    return builder.CreateICmpNE(val, builder.getInt32(0), "icmpne");
   }
 
-  Value* compile_compare(const shared_ptr<AstPL0> ast) {
-    auto lhs = compile_expression(ast->nodes[0]);
-    auto rhs = compile_expression(ast->nodes[2]);
+  static Value* compile_compare(IRBuilder<>& builder, Module* module,
+                                 GlobalVariable* tyinfo,
+                                 const shared_ptr<AstPL0> ast) {
+    auto lhs = compile_expression(builder, module, tyinfo, ast->nodes[0]);
+    auto rhs = compile_expression(builder, module, tyinfo, ast->nodes[2]);
 
     auto ope = ast->nodes[1]->token;
     switch (ope[0]) {
       case '=':
-        return builder_.CreateICmpEQ(lhs, rhs, "icmpeq");
+        return builder.CreateICmpEQ(lhs, rhs, "icmpeq");
       case '#':
-        return builder_.CreateICmpNE(lhs, rhs, "icmpne");
+        return builder.CreateICmpNE(lhs, rhs, "icmpne");
       case '<':
         if (ope.size() == 1) {
-          return builder_.CreateICmpSLT(lhs, rhs, "icmpslt");
+          return builder.CreateICmpSLT(lhs, rhs, "icmpslt");
         }
         // '<='
-        return builder_.CreateICmpSLE(lhs, rhs, "icmpsle");
+        return builder.CreateICmpSLE(lhs, rhs, "icmpsle");
       case '>':
         if (ope.size() == 1) {
-          return builder_.CreateICmpSGT(lhs, rhs, "icmpsgt");
+          return builder.CreateICmpSGT(lhs, rhs, "icmpsgt");
         }
         // '>='
-        return builder_.CreateICmpSGE(lhs, rhs, "icmpsge");
+        return builder.CreateICmpSGE(lhs, rhs, "icmpsge");
     }
     return nullptr;
   }
 
-  void compile_out(const shared_ptr<AstPL0> ast) {
-    auto val = compile_expression(ast->nodes[0]);
-    auto fn = module_->getFunction("out");
-    builder_.CreateCall(fn, val);
+  static void compile_out(IRBuilder<>& builder, Module* module,
+                           GlobalVariable* tyinfo,
+                           const shared_ptr<AstPL0> ast) {
+    auto val = compile_expression(builder, module, tyinfo, ast->nodes[0]);
+    auto fn = module->getFunction("out");
+    builder.CreateCall(fn, val);
   }
 
-  Value* compile_expression(const shared_ptr<AstPL0> ast) {
+  static Value* compile_expression(IRBuilder<>& builder, Module* module,
+                                    GlobalVariable* tyinfo,
+                                    const shared_ptr<AstPL0> ast) {
     const auto& nodes = ast->nodes;
 
     auto sign = nodes[0]->token;
     auto negative = !(sign.empty() || sign == "+");
 
-    auto val = compile_term(nodes[1]);
+    auto val = compile_term(builder, module, tyinfo, nodes[1]);
     if (negative) {
-      val = builder_.CreateNeg(val, "negative");
+      val = builder.CreateNeg(val, "negative");
     }
 
     for (auto i = 2u; i < nodes.size(); i += 2) {
       auto ope = nodes[i + 0]->token[0];
-      auto rval = compile_term(nodes[i + 1]);
+      auto rval = compile_term(builder, module, tyinfo, nodes[i + 1]);
       switch (ope) {
         case '+':
-          val = builder_.CreateAdd(val, rval, "add");
+          val = builder.CreateAdd(val, rval, "add");
           break;
         case '-':
-          val = builder_.CreateSub(val, rval, "sub");
+          val = builder.CreateSub(val, rval, "sub");
           break;
       }
     }
     return val;
   }
 
-  Value* compile_term(const shared_ptr<AstPL0> ast) {
+  static Value* compile_term(IRBuilder<>& builder, Module* module,
+                              GlobalVariable* tyinfo,
+                              const shared_ptr<AstPL0> ast) {
     const auto& nodes = ast->nodes;
-    auto val = compile_factor(nodes[0]);
+    auto val = compile_factor(builder, module, tyinfo, nodes[0]);
     for (auto i = 1u; i < nodes.size(); i += 2) {
       auto ope = nodes[i + 0]->token[0];
-      auto rval = compile_switch_value(nodes[i + 1]);
+      auto rval = compile_switch_value(builder, module, tyinfo, nodes[i + 1]);
       switch (ope) {
         case '*':
-          val = builder_.CreateMul(val, rval, "mul");
+          val = builder.CreateMul(val, rval, "mul");
           break;
         case '/': {
           // Zero divide check
           auto cond =
-              builder_.CreateICmpEQ(rval, builder_.getInt32(0), "icmpeq");
+              builder.CreateICmpEQ(rval, builder.getInt32(0), "icmpeq");
 
-          auto fn = builder_.GetInsertBlock()->getParent();
-          auto ifZeroBB = BasicBlock::Create(context_, "zdiv.zero", fn);
-          auto ifNonZeroBB = BasicBlock::Create(context_, "zdiv.non_zero");
-          builder_.CreateCondBr(cond, ifZeroBB, ifNonZeroBB);
+          auto fn = builder.GetInsertBlock()->getParent();
+          auto ifZeroBB = BasicBlock::Create(builder.getContext(), "zdiv.zero", fn);
+          auto ifNonZeroBB = BasicBlock::Create(builder.getContext(), "zdiv.non_zero");
+          builder.CreateCondBr(cond, ifZeroBB, ifNonZeroBB);
 
           // zero
           {
-            builder_.SetInsertPoint(ifZeroBB);
+            builder.SetInsertPoint(ifZeroBB);
 
             Value* eh = nullptr;
             {
               auto fn = cast<Function>(
-                  module_
+                  module
                       ->getOrInsertFunction("__cxa_allocate_exception",
-                                            builder_.getPtrTy(),
-                                            builder_.getInt64Ty())
+                                            builder.getPtrTy(),
+                                            builder.getInt64Ty())
                       .getCallee());
 
-              eh = builder_.CreateCall(fn, builder_.getInt64(8), "eh");
+              eh = builder.CreateCall(fn, builder.getInt64(8), "eh");
 
-              auto msg = builder_.CreateGlobalString(
+              auto msg = builder.CreateGlobalString(
                   "divide by 0", ".str.zero_divide");
 
-              builder_.CreateStore(msg, eh);
+              builder.CreateStore(msg, eh);
             }
 
             {
               auto fn = cast<Function>(
-                  module_
-                      ->getOrInsertFunction("__cxa_throw", builder_.getVoidTy(),
-                                            builder_.getPtrTy(),
-                                            builder_.getPtrTy(),
-                                            builder_.getPtrTy())
+                  module
+                      ->getOrInsertFunction("__cxa_throw", builder.getVoidTy(),
+                                            builder.getPtrTy(),
+                                            builder.getPtrTy(),
+                                            builder.getPtrTy())
                       .getCallee());
 
-              builder_.CreateCall(
+              builder.CreateCall(
                   fn,
-                  {eh, tyinfo_, ConstantPointerNull::get(builder_.getPtrTy())});
+                  {eh, tyinfo, ConstantPointerNull::get(builder.getPtrTy())});
             }
 
-            builder_.CreateUnreachable();
+            builder.CreateUnreachable();
           }
 
           // no_zero
           {
             fn->insert(fn->end(), ifNonZeroBB);
-            builder_.SetInsertPoint(ifNonZeroBB);
-            val = builder_.CreateSDiv(val, rval, "div");
+            builder.SetInsertPoint(ifNonZeroBB);
+            val = builder.CreateSDiv(val, rval, "div");
           }
           break;
         }
@@ -750,14 +792,17 @@ struct JIT {
     return val;
   }
 
-  Value* compile_factor(const shared_ptr<AstPL0> ast) {
-    return compile_switch_value(ast->nodes[0]);
+  static Value* compile_factor(IRBuilder<>& builder, Module* module,
+                                GlobalVariable* tyinfo,
+                                const shared_ptr<AstPL0> ast) {
+    return compile_switch_value(builder, module, tyinfo, ast->nodes[0]);
   }
 
-  Value* compile_ident(const shared_ptr<AstPL0> ast) {
+  static Value* compile_ident(IRBuilder<>& builder,
+                               const shared_ptr<AstPL0> ast) {
     auto ident = ast->token;
 
-    auto fn = builder_.GetInsertBlock()->getParent();
+    auto fn = builder.GetInsertBlock()->getParent();
     auto tbl = fn->getValueSymbolTable();
     auto var = tbl->lookup(ident);
     if (!var) {
@@ -765,11 +810,12 @@ struct JIT {
                           "'" + std::string(ident) + "' is not defined...");
     }
 
-    return builder_.CreateLoad(builder_.getInt32Ty(), var);
+    return builder.CreateLoad(builder.getInt32Ty(), var);
   }
 
-  Value* compile_number(const shared_ptr<AstPL0> ast) {
-    return ConstantInt::getIntegerValue(builder_.getInt32Ty(),
+  static Value* compile_number(IRBuilder<>& builder,
+                                const shared_ptr<AstPL0> ast) {
+    return ConstantInt::getIntegerValue(builder.getInt32Ty(),
                                         APInt(32, ast->token, 10));
   }
 };
