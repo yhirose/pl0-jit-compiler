@@ -275,7 +275,7 @@ struct JIT {
     module_ = make_unique<Module>("pl0", context_);
 
     tyinfo_ =
-        new GlobalVariable(*module_, builder_.getInt8PtrTy(), true,
+        new GlobalVariable(*module_, builder_.getPtrTy(), true,
                            GlobalValue::ExternalLinkage, nullptr, "_ZTIPKc");
   }
 
@@ -350,11 +350,10 @@ struct JIT {
 
       auto printFn = module_->getOrInsertFunction(
           "printf",
-          FunctionType::get(builder_.getInt32Ty(),
-                            PointerType::get(builder_.getInt8Ty(), 0), true));
+          FunctionType::get(builder_.getInt32Ty(), builder_.getPtrTy(), true));
 
       auto val = &*outFn->arg_begin();
-      auto fmt = builder_.CreateGlobalStringPtr("%d\n", ".printf.fmt");
+      auto fmt = builder_.CreateGlobalString("%d\n", ".printf.fmt");
       builder_.CreateCall(printFn, {fmt, val});
 
       builder_.CreateRetVoid();
@@ -400,11 +399,10 @@ struct JIT {
       builder_.SetInsertPoint(lpadBB);
 
       auto exc = builder_.CreateLandingPad(
-          StructType::get(builder_.getInt8PtrTy(), builder_.getInt32Ty()), 1,
+          StructType::get(builder_.getPtrTy(), builder_.getInt32Ty()), 1,
           "exc");
 
-      exc->addClause(
-          ConstantExpr::getBitCast(tyinfo_, builder_.getInt8PtrTy()));
+      exc->addClause(tyinfo_);
 
       auto ptr = builder_.CreateExtractValue(exc, {0}, "exc.ptr");
       auto sel = builder_.CreateExtractValue(exc, {1}, "exc.sel");
@@ -413,10 +411,9 @@ struct JIT {
           cast<Function>(module_
                              ->getOrInsertFunction("llvm.eh.typeid.for",
                                                    builder_.getInt32Ty(),
-                                                   builder_.getInt8PtrTy())
+                                                   builder_.getPtrTy())
                              .getCallee()),
-          {ConstantExpr::getBitCast(tyinfo_, builder_.getInt8PtrTy())},
-          "tid.int");
+          {tyinfo_}, "tid.int");
 
       auto catch_with_message =
           BasicBlock::Create(context_, "catch_with_message", fn);
@@ -424,18 +421,17 @@ struct JIT {
       auto cmp = builder_.CreateCmp(CmpInst::ICMP_EQ, sel, id, "tst.int");
       builder_.CreateCondBr(cmp, catch_with_message, catch_unknown);
 
-      auto beginCatchFn =
-          cast<Function>(module_
-                             ->getOrInsertFunction("__cxa_begin_catch",
-                                                   builder_.getInt8PtrTy(),
-                                                   builder_.getInt8PtrTy())
-                             .getCallee());
+      auto beginCatchFn = cast<Function>(
+          module_
+              ->getOrInsertFunction("__cxa_begin_catch", builder_.getPtrTy(),
+                                    builder_.getPtrTy())
+              .getCallee());
 
       auto endCatchFn =
           module_->getOrInsertFunction("__cxa_end_catch", builder_.getVoidTy());
 
       auto putFn = module_->getOrInsertFunction("puts", builder_.getInt32Ty(),
-                                                builder_.getInt8PtrTy());
+                                                builder_.getPtrTy());
 
       {
         builder_.SetInsertPoint(catch_with_message);
@@ -451,14 +447,14 @@ struct JIT {
 
         builder_.CreateCall(beginCatchFn, ptr);
         auto str =
-            builder_.CreateGlobalStringPtr("unknown error...", ".str.unknown");
+            builder_.CreateGlobalString("unknown error...", ".str.unknown");
         builder_.CreateCall(putFn, str);
         builder_.CreateCall(endCatchFn);
         builder_.CreateBr(endBB);
       }
 
       {
-        fn->getBasicBlockList().push_back(endBB);
+        fn->insert(fn->end(), endBB);
         builder_.SetInsertPoint(endBB);
 
         builder_.CreateRetVoid();
@@ -499,7 +495,7 @@ struct JIT {
       auto block = ast->nodes[i + 1];
 
       std::vector<Type*> pt(block->scope->free_variables.size(),
-                            Type::getInt32PtrTy(context_));
+                            builder_.getPtrTy());
       auto fn = cast<Function>(
           module_
               ->getOrInsertFunction(
@@ -589,7 +585,7 @@ struct JIT {
     compile_statement(ast->nodes[1]);
     builder_.CreateBr(ifEndBB);
 
-    fn->getBasicBlockList().push_back(ifEndBB);
+    fn->insert(fn->end(), ifEndBB);
     builder_.SetInsertPoint(ifEndBB);
   }
 
@@ -598,7 +594,7 @@ struct JIT {
     builder_.CreateBr(whileCondBB);
 
     auto fn = builder_.GetInsertBlock()->getParent();
-    fn->getBasicBlockList().push_back(whileCondBB);
+    fn->insert(fn->end(), whileCondBB);
     builder_.SetInsertPoint(whileCondBB);
 
     auto cond = compile_condition(ast->nodes[0]);
@@ -612,7 +608,7 @@ struct JIT {
 
     builder_.CreateBr(whileCondBB);
 
-    fn->getBasicBlockList().push_back(whileEndBB);
+    fn->insert(fn->end(), whileEndBB);
     builder_.SetInsertPoint(whileEndBB);
   }
 
@@ -712,35 +708,30 @@ struct JIT {
               auto fn = cast<Function>(
                   module_
                       ->getOrInsertFunction("__cxa_allocate_exception",
-                                            builder_.getInt8PtrTy(),
+                                            builder_.getPtrTy(),
                                             builder_.getInt64Ty())
                       .getCallee());
 
               eh = builder_.CreateCall(fn, builder_.getInt64(8), "eh");
 
-              auto payload = builder_.CreateBitCast(
-                  eh, builder_.getInt8PtrTy()->getPointerTo(), "payload");
+              auto msg = builder_.CreateGlobalString(
+                  "divide by 0", ".str.zero_divide");
 
-              auto msg = builder_.CreateGlobalStringPtr(
-                  "divide by 0", ".str.zero_divide", 0, module_.get());
-
-              builder_.CreateStore(msg, payload);
+              builder_.CreateStore(msg, eh);
             }
 
             {
               auto fn = cast<Function>(
                   module_
                       ->getOrInsertFunction("__cxa_throw", builder_.getVoidTy(),
-                                            builder_.getInt8PtrTy(),
-                                            builder_.getInt8PtrTy(),
-                                            builder_.getInt8PtrTy())
+                                            builder_.getPtrTy(),
+                                            builder_.getPtrTy(),
+                                            builder_.getPtrTy())
                       .getCallee());
 
               builder_.CreateCall(
                   fn,
-                  {eh,
-                   ConstantExpr::getBitCast(tyinfo_, builder_.getInt8PtrTy()),
-                   ConstantPointerNull::get(builder_.getInt8PtrTy())});
+                  {eh, tyinfo_, ConstantPointerNull::get(builder_.getPtrTy())});
             }
 
             builder_.CreateUnreachable();
@@ -748,7 +739,7 @@ struct JIT {
 
           // no_zero
           {
-            fn->getBasicBlockList().push_back(ifNonZeroBB);
+            fn->insert(fn->end(), ifNonZeroBB);
             builder_.SetInsertPoint(ifNonZeroBB);
             val = builder_.CreateSDiv(val, rval, "div");
           }
